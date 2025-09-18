@@ -21,9 +21,11 @@ import okhttp3.FormBody
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import uy.kohesive.injekt.injectLazy
@@ -290,25 +292,66 @@ class Aniweek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
         val parsed = json.decodeFromString<IframeResponse>(postResponse)
 
         return if (parsed.hls) {
+            val host = iframeUrl.toHttpUrl().host
+
             val masterHeaders = headers.newBuilder().apply {
                 add("Accept", "*/*")
                 add("Cookie", cookieValue.substringBefore(";"))
-                add("Host", iframeUrl.toHttpUrl().host)
+                add("Host", host)
                 add("Referer", iframeUrl)
                 add("Sec-Fetch-Dest", "empty")
                 add("Sec-Fetch-Mode", "cors")
                 add("Sec-Fetch-Site", "same-origin")
-                add("TE", "trailers")
             }.build()
 
             fun genVideoHeaders(baseHeaders: Headers, referer: String, videoUrl: String): Headers {
                 return baseHeaders.newBuilder().apply {
                     add("Accept", "*/*")
-                    add("Origin", "https://${iframeUrl.toHttpUrl().host}")
-                    add("Referer", "https://${iframeUrl.toHttpUrl().host}/")
+                    add("Origin", "https://$host")
+                    add("Referer", if (referer.isNotEmpty()) referer else videoUrl.substringBeforeLast('/') + "/")
                 }.build()
             }
 
+            // ── 조각 스트림(720p_/1080p_)이면 합본 m3u8을 즉석 생성하여 반환 ──
+            val seed = detectPartSeed(parsed.videoSource)
+            if (seed != null) {
+                val parts = enumerateParts(seed, masterHeaders, client)
+                if (parts.isEmpty()) return emptyList()
+
+                val merged = synthesizeM3u8(parts, target = 15, defaultDur = 4.0)
+
+                // 가짜 경로로 들어오는 요청에 합성 m3u8을 바로 응답
+                val mergedPath = "/__merged__/${hash}.m3u8"
+                val mergedUrl = "https://$host$mergedPath"
+                val mergedClient = client.newBuilder()
+                    .addInterceptor { chain ->
+                        val req = chain.request()
+                        if (req.url.encodedPath == mergedPath) {
+                            return@addInterceptor okhttp3.Response.Builder()
+                                .request(req)
+                                .protocol(okhttp3.Protocol.HTTP_1_1)
+                                .code(200)
+                                .message("OK")
+                                .header("Content-Type", "application/vnd.apple.mpegurl")
+                                .body(
+                                    merged.toByteArray()
+                                        .toResponseBody("application/vnd.apple.mpegurl".toMediaType()),
+                                )
+                                .build()
+                        }
+                        chain.proceed(req)
+                    }
+                    .build()
+
+                val localPlaylist = PlaylistUtils(mergedClient, masterHeaders)
+                return localPlaylist.extractFromHls(
+                    mergedUrl,
+                    masterHeadersGen = { _, _ -> masterHeaders },
+                    videoHeadersGen = ::genVideoHeaders,
+                )
+            }
+
+            // ── 정상 HLS(m3u8) 경로 ──
             playlistUtils.extractFromHls(
                 parsed.videoSource,
                 masterHeadersGen = { _, _ -> masterHeaders },
@@ -376,5 +419,72 @@ class Aniweek : ConfigurableAnimeSource, ParsedAnimeHttpSource() {
                 preferences.edit().putString(key, entry).commit()
             }
         }.also(screen::addPreference)
+    }
+
+    // ====================== Multipart playlist helpers ====================
+
+    // 720p_/1080p_ 접두사 + 세 자리 인덱스만 타겟
+    private val PART_RE = Regex(
+        pattern = """^(https?://[^"'<>]+/)((?:720|1080)p_)(\d{3})\.html$""",
+        option = RegexOption.IGNORE_CASE,
+    )
+
+    private data class PartSeed(val base: String, val prefix: String, val start: Int)
+
+    private fun detectPartSeed(urlOrText: String): PartSeed? {
+        val m = PART_RE.find(urlOrText.trim()) ?: return null
+        val (base, pre, idx) = m.destructured
+        return PartSeed(base, pre, idx.toInt())
+    }
+
+    private fun enumerateParts(
+        seed: PartSeed,
+        headers: Headers,
+        client: OkHttpClient,
+        hardCap: Int = 4096,
+    ): List<String> {
+        val out = ArrayList<String>()
+        var i = seed.start
+        while (i - seed.start < hardCap) {
+            val u = "${seed.base}${seed.prefix}%03d.html".format(i)
+            val headReq = Request.Builder().url(u).headers(headers).head().build()
+            val finalUrl = runCatching {
+                client.newCall(headReq).execute().use { r ->
+                    when {
+                        r.isSuccessful -> r.request.url.toString()
+                        r.code in 300..399 && r.header("Location") != null -> {
+                            r.close()
+                            client.newCall(Request.Builder().url(u).headers(headers).get().build())
+                                .execute().use { rr ->
+                                    if (!rr.isSuccessful) return@runCatching null
+                                    rr.request.url.toString()
+                                }
+                        }
+                        else -> null
+                    }
+                }
+            }.getOrNull()
+
+            if (finalUrl == null) break
+            out += finalUrl
+            i++
+        }
+        return out
+    }
+
+    private fun synthesizeM3u8(
+        urls: List<String>,
+        target: Int = 15,
+        defaultDur: Double = 4.0,
+    ): String = buildString {
+        append("#EXTM3U\n#EXT-X-VERSION:3\n")
+        append("#EXT-X-TARGETDURATION:").append(target).append('\n')
+        append("#EXT-X-MEDIA-SEQUENCE:0\n")
+        urls.forEachIndexed { idx, u ->
+            if (idx > 0) append("#EXT-X-DISCONTINUITY\n")
+            append("#EXTINF:").append(String.format(Locale.US, "%.3f", defaultDur)).append(",\n")
+            append(u).append('\n')
+        }
+        append("#EXT-X-ENDLIST\n")
     }
 }
